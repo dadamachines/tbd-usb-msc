@@ -339,21 +339,13 @@ static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
 
     ESP_LOGI(TAG, "Initializing SDCard");
 
-    // reset SD-Card, config EXAMPLE_PIN_SD_RESET to output and toggle
-    gpio_reset_pin(CONFIG_EXAMPLE_PIN_SD_RESET);
-    gpio_set_direction(CONFIG_EXAMPLE_PIN_SD_RESET, GPIO_MODE_OUTPUT);
-    gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
-    // For setting a specific frequency, use host.max_freq_khz (range 400kHz - 40MHz for SDMMC)
-    // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
-    host.max_freq_khz = SDMMC_FREQ_DDR50;
-    host.flags |= SDMMC_HOST_FLAG_DDR;
+    host.flags |= SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
+    // Use high-speed 50 MHz 4-bit — NOT DDR50/UHS-I.
+    // UHS-I tuning is unreliable on cold boot and failed tuning
+    // corrupts the SDMMC sampling delay for all subsequent commands.
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 
     // For SoCs where the SD power can be supplied both via an internal or external (e.g. on-board LDO) power supply.
     // When using specific IO pins (which can be used for ultra high-speed SDMMC) to connect to the SD card
@@ -379,7 +371,7 @@ static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
     // For SD Card, set bus width to use
 #ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
     slot_config.width = 4;
-    slot_config.flags |= SDMMC_SLOT_FLAG_UHS1;
+    // No SDMMC_SLOT_FLAG_UHS1 — UHS-I tuning is unreliable on cold boot.
 #else
     slot_config.width = 1;
 #endif  // CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
@@ -416,9 +408,34 @@ static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
     ESP_GOTO_ON_ERROR(sdmmc_host_init_slot(host.slot, (const sdmmc_slot_config_t *) &slot_config),
                       clean, TAG, "Host init slot fail");
 
-    while (sdmmc_card_init(&host, sd_card)) {
-        ESP_LOGE(TAG, "The detection pin of the slot is disconnected(Insert uSD card). Retrying...");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+    // Retry with power cycling and escalating settle times (matches fs.cpp)
+    {
+        const int max_retries = 5;
+        bool card_ok = false;
+        for (int attempt = 1; attempt <= max_retries; attempt++) {
+            int settle_ms = (attempt <= 2) ? 200 + (attempt - 1) * 100
+                                           : 200 + attempt * 100;
+            // Power-cycle: GPIO 45 controls SD card power (active-low)
+            gpio_reset_pin(CONFIG_EXAMPLE_PIN_SD_RESET);
+            gpio_set_direction(CONFIG_EXAMPLE_PIN_SD_RESET, GPIO_MODE_OUTPUT);
+            gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 1);   // power off
+            vTaskDelay(pdMS_TO_TICKS(100));
+            gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 0);   // power on
+            vTaskDelay(pdMS_TO_TICKS(settle_ms));
+
+            if (sdmmc_card_init(&host, sd_card) == ESP_OK) {
+                card_ok = true;
+                break;
+            }
+            ESP_LOGW(TAG, "SD card init attempt %d/%d failed (settle=%dms), retrying...",
+                     attempt, max_retries, settle_ms);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (!card_ok) {
+            ESP_LOGE(TAG, "SD card init failed after %d attempts", max_retries);
+            ret = ESP_FAIL;
+            goto clean;
+        }
     }
 
     // Card has been initialized, print its properties
