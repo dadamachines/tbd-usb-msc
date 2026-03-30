@@ -1,0 +1,30 @@
+dadamachines TBD-16 — USB MSC Firmware
+
+(c) 2025-2026 Johannes Elias Lohbihler for dadamachines.
+
+
+LICENSE
+-------
+
+This firmware is licensed under the GNU Lesser General Public License (LGPL 3.0).
+https://www.gnu.org/licenses/lgpl-3.0.txt
+
+Upstream code from ctag-fh-kiel/tbd-usb-msc is licensed under
+Unlicense / CC0-1.0 (https://creativecommons.org/publicdomain/zero/1.0/).
+
+LGPL 3.0 means:
+- Individual developers can freely use, modify, and contribute to this
+  code without being required to release their own unrelated code.
+- Modifications to the LGPL'd code itself must be shared under the same
+  terms if distributed.
+- Other companies may not use these components commercially without
+  contributing their modifications back as open source.
+- If you need a commercial license that allows proprietary modifications,
+  contact dadamachines: https://dadamachines.com/contact/
+
+
+THE DADAMACHINES NAME AND BRAND
+-------------------------------
+The dadamachines name, logo, and TBD-16 product name are trademarks of
+dadamachines and are reserved for products produced by or licensed by
+dadamachines.

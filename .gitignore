@@ -1,0 +1,26 @@
+# ESP-IDF specific
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+*.map
+*.elf
+*.bin
+*.hex
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+
+# Backup files
+*.bak
+
+# Python cache
+__pycache__/

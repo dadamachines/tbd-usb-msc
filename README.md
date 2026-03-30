@@ -1,103 +1,80 @@
-# USB Device Mass Storage Class
-- intended to be ota1 partition as housekeeping firmware
-- makes available sdcard thru usb msc class
-- upon dismount boots into ota0
-- runs spi cmd api
-- allows to flash c6 esp hosted slave firmware
-  - esp hosted slave firmware network_adapter.bin must be placed in sdcard folder "c6_fw" beforehand, e.g. when sd card is mounted on host pc
+# dadamachines TBD-16 — USB MSC Firmware
 
+USB Mass Storage Class firmware for the **[dadamachines TBD-16](https://dadamachines.com)** audio DSP platform. Exposes the on-board SD card as a USB drive for file management and firmware updates — no need to open the device.
 
-| Supported Targets | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | -------- | -------- | -------- |
+This is a fork of [ctag-fh-kiel/tbd-usb-msc](https://github.com/ctag-fh-kiel/tbd-usb-msc), adapted for the TBD-16 (ESP32-P4) hardware.
 
-# TinyUSB Mass Storage Device Example
+## What It Does
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+This firmware runs in the **OTA1 slot** of the TBD-16 as a "housekeeping" partition:
 
-Mass Storage Devices are one of the most common USB devices. It use Mass Storage Class (MSC) that allow access to their internal data storage.
-This example contains code to make ESP based device recognizable by USB-hosts as a USB Mass Storage Device.
-It either allows the embedded application i.e. example to access the partition or Host PC accesses the partition over USB MSC.
-They can't be allowed to access the partition at the same time.
+- **SD card over USB** — Mounts the SD card as a USB Mass Storage device so a host PC can read/write files directly
+- **Auto-reboot** — When the host ejects the drive, the device reboots back into the main firmware (OTA0)
+- **SPI command API** — Accepts commands from the RP2350 sequencer bridge over SPI
+- **ESP32-C6 OTA** — Flashes ESP-Hosted slave firmware to the on-board ESP32-C6 WiFi module from a file on the SD card
 
-This example supports storage media of two types:
-1. SPI Flash
-2. SD MMC Card
+## Target Hardware
 
-Data is read/written from/to SPI Flash through wear-levelling APIs. Wear leveling is a technique that helps to distribute wear and tear among sectors more evenly without requiring any attention from the user. As a result, it helps in extending the life of each sector of the Flash memory.
+| Target | Status |
+|--------|--------|
+| ESP32-P4 (TBD-16) | **Primary** — actively developed and tested |
+| ESP32-S3 | Upstream support (not tested with TBD-16 hardware) |
 
-As a USB stack, a TinyUSB component is used.
+## Building
 
-## How to use example
-
-### Scenarios
-1. USB which accesses the ESP MSC Partition is unplugged initially and the board is powered-on.
-     - Result: Host PC can't access the partition over USB MSC. Application example can perform operations (read, write) on partition.
-2. USB which accesses the ESP MSC Partition is already plugged-in at boot time.
-     - Result: Host PC recongnize it as removable device and can access the partition over USB MSC. Application example can't perform any operation on partition.
-3. USB which accesses the ESP MSC Partition is plugged-in at boot-up. After boot-up, it is ejected on Host PC manually by user.
-     - Result: Host PC can't access the partition over USB MSC. Application example can perform operations (read, write) on partition.
-4. USB which accesses the ESP MSC Partition is plugged-in at boot-up. It is then unplugged(removed) from Host PC manually by user.
-     - Result: The behaviour is different for bus-powered devices and self-powered devices
-          - (a) Bus-Powered devices - Both Host PC as well as application example can't access the partition over USB MSC. Here, the device will be Powered-off.
-          - (b) Self-Powered devices - Here, the device can be powered-on even after unplugging the device from Host PC. These behaviour can be further categorize in two ways:
-               - (i) Self-Powered Devices without VBUS monitoring - Both Host PC as well as application example can't access the partition over USB MSC.
-               - (ii) Self-Powered Devices with VBUS monitoring - Host PC can't access the partition over USB MSC. Application example can perform operations (read, write) on partition. Here, in ``tinyusb_config_t`` user must set ``self_powered`` to ``true`` and ``vbus_monitor_io`` to GPIO number (``VBUS_MONITORING_GPIO_NUM``) that will be used for VBUS monitoring.
-
-### Hardware Required
-
-1. If the storage media is SPI Flash, any ESP board that have USB-OTG is supported.
-2. If the storage media is SD MMC Card, any ESP board with SD MMC card slot and an SD card is required. For Ex - ESP32-S3-USB-OTG
-
-### Pin Assignment
-
-_Note:_ In case your board doesn't have micro-USB connector connected to USB-OTG peripheral, you may have to DIY a cable and connect **D+** and **D-** to the pins listed below.
-
-See common pin assignments for USB Device examples from [upper level](../../README.md#common-pin-assignments).
-
-Next, for Self-Powered Devices with VBUS monitoring, user must set ``self_powered`` to ``true`` and ``vbus_monitor_io`` to GPIO number (``VBUS_MONITORING_GPIO_NUM``) that will be used for VBUS monitoring.
-
-### Additional Pin assignments for ESP32-S3 for accessing SD MMC Card
-
-On ESP32-S3, SDMMC peripheral is connected to GPIO pins using GPIO matrix. This allows arbitrary GPIOs to be used to connect an SD card. In this example, GPIOs can be configured in two ways:
-
-1. Using menuconfig: Run `idf.py menuconfig` in the project directory, open "USB DEV MSC Example Configuration" and select "SDMMC CARD" for "Storage Media Used".
-2. In the source code: See the initialization of ``sdmmc_slot_config_t slot_config`` structure in the example code.
-
-The table below lists the default pin assignments.
-
-When using an ESP32-S3-USB-OTG board, this example runs without any extra modifications required. Only an SD card needs to be inserted into the slot.
-
-ESP32-S3 pin  | SD card pin | Notes
---------------|-------------|------------
-GPIO36        | CLK         | 10k pullup
-GPIO35        | CMD         | 10k pullup
-GPIO37        | D0          | 10k pullup
-GPIO38        | D1          | not used in 1-line SD mode; 10k pullup in 4-line mode
-GPIO33        | D2          | not used in 1-line SD mode; 10k pullup in 4-line mode
-GPIO34        | D3          | not used in 1-line SD mode, but card's D3 pin must have a 10k pullup
-
-By default, this example uses 4 line SD mode, utilizing 6 pins: CLK, CMD, D0 - D3. It is possible to use 1-line mode (CLK, CMD, D0) by changing "SD/MMC bus width" in the example configuration menu (see `CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_1`).
-
-Note that even if card's D3 line is not connected to the ESP chip, it still has to be pulled up, otherwise the card will go into SPI protocol mode.
-
-### Build and Flash
-
-1. By default, the example will compile to access SPI Flash as storage media. Here, SPI Flash Wear Levelling WL_SECTOR_SIZE is set to 512 and WL_SECTOR_MODE is set to PERF in Menuconfig.
-2. In order to access SD MMC card as storage media, configuration has to be changed using `idf.py menuconfig`:
-  - i. Open "USB Dev MSC Example Configuration" and select "SDMMC CARD" for "Storage Media Used"
-  - ii. Open "SD/MMC bus width" and select between "4 lines (D0 - D3)" or "1 line (D0)"
-  - iii. Select the GPIO Pin numbers for SD Card Pin.
-  - iv. Save the configuration.
-
-Build the project and flash it to the board, then run monitor tool to view serial output:
+Requires [ESP-IDF v5.5.x](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32p4/get-started/index.html).
 
 ```bash
-idf.py -p PORT flash monitor
+source ~/esp/esp-idf/export.sh
+idf.py set-target esp32p4
+idf.py build
 ```
 
-(Replace PORT with the name of the serial port to use.)
+The build system automatically applies patches from `patches/` to ESP-IDF at configure time.
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+## Flashing
+
+The MSC firmware is flashed to the OTA1 partition by the [TBD-16 Firmware Update Tool](https://github.com/dadamachines/dada-tbd-tui) or the [browser-based flasher](https://dadamachines.github.io/ctag-tbd/flash/10_stable_channel.html). For manual flashing with `esptool.py`, use `--chip esp32p4`.
+
+## Project Structure
+
+```
+main/
+  tusb_msc_main.c      USB MSC device setup and console commands
+  spi_api.c/h           SPI slave command interface (RP2350 bridge)
+  ota_c6_sdcard.c/h     ESP32-C6 firmware update from SD card
+  custom_sdmmc_cmd.c    SDMMC command wrappers with retry/error handling
+  Kconfig.projbuild     Menuconfig options (storage media, pin config)
+patches/                ESP-IDF patches applied at build time
+```
+
+## Related Repositories
+
+- [dadamachines/ctag-tbd](https://github.com/dadamachines/ctag-tbd) — Main TBD-16 firmware (DSP engine, web UI, plugin system)
+- [dadamachines/dada-tbd-tui](https://github.com/dadamachines/dada-tbd-tui) — Terminal-based firmware update tool
+- [ctag-fh-kiel/ctag-tbd](https://github.com/ctag-fh-kiel/ctag-tbd) — Upstream CTAG TBD project
+
+## Acknowledgements
+
+**CTAG TBD** was created by [Robert Manzke](https://github.com/ctag-fh-kiel/ctag-tbd) at the [Creative Technologies Arbeitsgruppe](https://www.creative-technologies.de/), Kiel University of Applied Sciences.
+
+The TBD-16 adaptation is led by [dadamachines](https://dadamachines.com).
+
+## Funding
+
+This project is partially funded through the [NGI0 Commons Fund](https://nlnet.nl/commonsfund), established by [NLnet](https://nlnet.nl/) with financial support from the European Commission's [Next Generation Internet](https://ngi.eu/) programme, under grant agreement No [101135429](https://cordis.europa.eu/project/id/101135429).
+
+[<img src="https://nlnet.nl/logo/banner-320x120.png" alt="NLnet" width="160">](https://nlnet.nl/project/TBD-DSP-Toolkit/)
+
+## License
+
+This firmware is licensed under the [GNU Lesser General Public License (LGPL 3.0)](https://www.gnu.org/licenses/lgpl-3.0.txt).
+
+Upstream code from [ctag-fh-kiel/tbd-usb-msc](https://github.com/ctag-fh-kiel/tbd-usb-msc) is licensed under [Unlicense / CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+
+© 2025–2026 [Johannes Elias Lohbihler](https://dadamachines.com) for dadamachines. (TBD-16 adaptation)
+
+See [LICENSE](LICENSE) for details.
 
 See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
 
