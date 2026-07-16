@@ -21,7 +21,8 @@
 #include "esp_partition.h"
 #include "driver/gpio.h"
 #include "tinyusb.h"
-#include "tusb_msc_storage.h"
+#include "tinyusb_default_config.h"
+#include "tinyusb_msc.h"
 #include "esp_ota_ops.h"
 #include "spi_api.h"
 #include "ota_c6_sdcard.h"
@@ -48,6 +49,9 @@
 
 static const char *TAG = "example_main";
 static esp_console_repl_t *repl = NULL;
+static tinyusb_msc_storage_handle_t storage_hdl = NULL;
+static volatile tinyusb_msc_mount_point_t storage_mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB;
+static volatile bool host_was_mounted = false;
 
 static SemaphoreHandle_t _wait_console_smp = NULL;
 
@@ -173,49 +177,27 @@ const esp_console_cmd_t cmds[] = {
     }
 };
 
-// mount the partition and show all the files in BASE_PATH
-static void _mount(void)
+static bool storage_is_mounted_to_app(void)
 {
-    ESP_LOGI(TAG, "Mount storage...");
-    ESP_ERROR_CHECK(tinyusb_msc_storage_mount(BASE_PATH));
-
-    // List all the files in this directory
-    ESP_LOGI(TAG, "\nls command output:");
-    struct dirent *d;
-    DIR *dh = opendir(BASE_PATH);
-    if (!dh) {
-        if (errno == ENOENT) {
-            //If the directory is not found
-            ESP_LOGE(TAG, "Directory doesn't exist %s", BASE_PATH);
-        } else {
-            //If the directory is not readable then throw error and exit
-            ESP_LOGE(TAG, "Unable to read directory %s", BASE_PATH);
-        }
-        return;
-    }
-    //While the next entry is not readable we will print directory files
-    while ((d = readdir(dh)) != NULL) {
-        printf("%s\n", d->d_name);
-    }
-    return;
+    return storage_mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP;
 }
 
-// unmount storage
+// Expose storage to the USB host.
 static int console_unmount(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage is already exposed");
         return -1;
     }
-    ESP_LOGI(TAG, "Unmount storage...");
-    ESP_ERROR_CHECK(tinyusb_msc_storage_unmount());
+    ESP_LOGI(TAG, "Expose storage to USB host...");
+    ESP_ERROR_CHECK(tinyusb_msc_set_storage_mount_point(storage_hdl, TINYUSB_MSC_STORAGE_MOUNT_USB));
     return 0;
 }
 
 // read BASE_PATH/README.MD and print its contents
 static int console_read(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage exposed over USB. Application can't read from storage.");
         return -1;
     }
@@ -237,7 +219,7 @@ static int console_read(int argc, char **argv)
 // create file BASE_PATH/README.MD if it does not exist
 static int console_write(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage exposed over USB. Application can't write to storage.");
         return -1;
     }
@@ -258,12 +240,14 @@ static int console_write(int argc, char **argv)
 // Show storage size and sector size
 static int console_size(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage exposed over USB. Application can't access storage");
         return -1;
     }
-    uint32_t sec_count = tinyusb_msc_storage_get_sector_count();
-    uint32_t sec_size = tinyusb_msc_storage_get_sector_size();
+    uint32_t sec_count = 0;
+    uint32_t sec_size = 0;
+    ESP_ERROR_CHECK(tinyusb_msc_get_storage_capacity(storage_hdl, &sec_count));
+    ESP_ERROR_CHECK(tinyusb_msc_get_storage_sector_size(storage_hdl, &sec_size));
     printf("Storage Capacity %lluMB\n", ((uint64_t) sec_count) * sec_size / (1024 * 1024));
     return 0;
 }
@@ -271,15 +255,17 @@ static int console_size(int argc, char **argv)
 // Show storage status
 static int console_status(int argc, char **argv)
 {
-    printf("storage exposed over USB: %s\n", tinyusb_msc_storage_in_use_by_usb_host() ? "Yes" : "No");
+    printf("storage exposed over USB: %s\n", storage_is_mounted_to_app() ? "No" : "Yes");
     return 0;
 }
 
 // Exit from application
 static int console_exit(int argc, char **argv)
 {
-    tinyusb_msc_unregister_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED);
-    tinyusb_msc_storage_deinit();
+    if (storage_hdl != NULL) {
+        ESP_ERROR_CHECK(tinyusb_msc_delete_storage(storage_hdl));
+        storage_hdl = NULL;
+    }
     tinyusb_driver_uninstall();
 
     xSemaphoreGive(_wait_console_smp);
@@ -300,20 +286,40 @@ void boot_into_slot(int slot) { // slot 0 or 1
     printf("Boot into %s\n not successful", p->label);
 }
 
-// callback that is delivered when storage is mounted/unmounted by application.
-static void storage_mount_changed_cb(tinyusb_msc_event_t *event)
+// IDF 6 reports explicit target mount points. A host eject remounts the FAT
+// filesystem to the application; only then is local C6 update access safe.
+static void storage_mount_changed_cb(tinyusb_msc_storage_handle_t handle,
+                                     tinyusb_msc_event_t *event,
+                                     void *arg)
 {
-    static bool first_time = false;
-    ESP_LOGI(TAG, "Storage mounted to application: %s", event->mount_changed_data.is_mounted ? "Yes" : "No");
-    // when storage is dismounted for the first time, boot into ota_0
-    if (!first_time && tinyusb_msc_storage_in_use_by_usb_host()){
-        first_time = true;
+    (void)handle;
+    (void)arg;
+
+    if (event->id == TINYUSB_MSC_EVENT_MOUNT_START) {
+        ESP_LOGI(TAG, "MSC mount transition starting: target=%s",
+                 event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
+        return;
     }
-    if (first_time && !tinyusb_msc_storage_in_use_by_usb_host()){
-        // check if updating c6 is desired
-        ESP_ERROR_CHECK(tinyusb_msc_storage_mount(BASE_PATH));
+
+    if (event->id != TINYUSB_MSC_EVENT_MOUNT_COMPLETE) {
+        ESP_LOGE(TAG, "MSC mount transition failed: event=%d target=%s",
+                 (int)event->id,
+                 event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
+        return;
+    }
+
+    storage_mount_point = event->mount_point;
+    ESP_LOGI(TAG, "MSC mount transition complete: target=%s",
+             event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
+
+    if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB) {
+        host_was_mounted = true;
+        return;
+    }
+
+    if (host_was_mounted) {
+        host_was_mounted = false;
         ota_c6_sd_perform(true, BASE_PATH "/c6_fw");
-        ESP_ERROR_CHECK(tinyusb_msc_storage_unmount());
         boot_into_slot(0);
     }
 }
@@ -560,47 +566,42 @@ void app_main(void)
         return;
     }
 
+    tinyusb_msc_storage_config_t storage_cfg = {
+        .fat_fs = {
+            .base_path = BASE_PATH,
+            .config = VFS_FAT_MOUNT_DEFAULT_CONFIG(),
+            .do_not_format = true,
+            .format_flags = 0,
+        },
+        .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
+    };
+
 #ifdef CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
     static wl_handle_t wl_handle = WL_INVALID_HANDLE;
     ESP_ERROR_CHECK(storage_init_spiflash(&wl_handle));
-
-    const tinyusb_msc_spiflash_config_t config_spi = {
-        .wl_handle = wl_handle,
-        .callback_mount_changed = storage_mount_changed_cb,  /* First way to register the callback. This is while initializing the storage. */
-        .mount_config.max_files = 5,
-    };
-    ESP_ERROR_CHECK(tinyusb_msc_storage_init_spiflash(&config_spi));
-    ESP_ERROR_CHECK(tinyusb_msc_register_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED, storage_mount_changed_cb)); /* Other way to register the callback i.e. registering using separate API. If the callback had been already registered, it will be overwritten. */
+    storage_cfg.medium.wl_handle = wl_handle;
+    ESP_ERROR_CHECK(tinyusb_msc_new_storage_spiflash(&storage_cfg, &storage_hdl));
 #else // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
     static sdmmc_card_t *card = NULL;
     ESP_ERROR_CHECK(storage_init_sdmmc(&card));
+    storage_cfg.medium.card = card;
+    ESP_ERROR_CHECK(tinyusb_msc_new_storage_sdmmc(&storage_cfg, &storage_hdl));
+#endif
 
-    const tinyusb_msc_sdmmc_config_t config_sdmmc = {
-        .card = card,
-        .callback_mount_changed = storage_mount_changed_cb,  /* First way to register the callback. This is while initializing the storage. */
-        .mount_config.max_files = 5,
-    };
-    ESP_ERROR_CHECK(tinyusb_msc_storage_init_sdmmc(&config_sdmmc));
-    ESP_ERROR_CHECK(tinyusb_msc_register_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED, storage_mount_changed_cb)); /* Other way to register the callback i.e. registering using separate API. If the callback had been already registered, it will be overwritten. */
-#endif  // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
-
-    //mounted in the app by default
-    _mount();
+    ESP_ERROR_CHECK(tinyusb_msc_set_storage_callback(storage_mount_changed_cb, NULL));
 
     ESP_LOGI(TAG, "USB MSC initialization");
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor = &descriptor_config,
-        .string_descriptor = string_desc_arr,
-        .string_descriptor_count = sizeof(string_desc_arr) / sizeof(string_desc_arr[0]),
-        .external_phy = false,
-#if (TUD_OPT_HIGH_SPEED)
-        .fs_configuration_descriptor = msc_fs_configuration_desc,
-        .hs_configuration_descriptor = msc_hs_configuration_desc,
-        .qualifier_descriptor = &device_qualifier,
-#else
-        .configuration_descriptor = msc_fs_configuration_desc,
-#endif // TUD_OPT_HIGH_SPEED
-    };
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    tusb_cfg.port = TINYUSB_PORT_HIGH_SPEED_0;
+    tusb_cfg.task = TINYUSB_TASK_CUSTOM(4096, 10, 0);
+    tusb_cfg.descriptor.device = &descriptor_config;
+    tusb_cfg.descriptor.full_speed_config = msc_fs_configuration_desc;
+    tusb_cfg.descriptor.string = string_desc_arr;
+    tusb_cfg.descriptor.string_count = sizeof(string_desc_arr) / sizeof(string_desc_arr[0]);
+#if TUD_OPT_HIGH_SPEED
+    tusb_cfg.descriptor.high_speed_config = msc_hs_configuration_desc;
+    tusb_cfg.descriptor.qualifier = &device_qualifier;
+#endif
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
     ESP_LOGI(TAG, "USB MSC initialization DONE");
 

@@ -42,14 +42,17 @@ Never eject a still-mounted volume.
 
 ## Building
 
-Requires [ESP-IDF v5.5.x](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32p4/get-started/index.html).
+Requires [ESP-IDF v6.0.1](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32p4/get-started/index.html), matching the main TBD-16 P4 firmware.
 
 ```bash
-source ~/esp/esp-idf/export.sh
+source ~/esp/esp-idf-v6.0.1/export.sh
 ./build.sh
 ```
 
-The build system automatically applies patches from `patches/` to ESP-IDF at configure time.
+The component manifest tracks the latest reviewed stable ESP-Hosted and
+Espressif TinyUSB lines. Run `idf.py update-dependencies` deliberately when
+refreshing these packages, review the resolved versions, and commit any manifest
+constraint changes. Do not patch a shared ESP-IDF installation from this repo.
 
 ## Flashing
 
@@ -62,9 +65,7 @@ main/
   tusb_msc_main.c      USB MSC device setup and console commands
   spi_api.c/h           SPI slave command interface (RP2350 bridge)
   ota_c6_sdcard.c/h     ESP32-C6 firmware update from SD card
-  custom_sdmmc_cmd.c    SDMMC command wrappers with retry/error handling
   Kconfig.projbuild     Menuconfig options (storage media, pin config)
-patches/                ESP-IDF patches applied at build time
 ```
 
 ## Related Repositories

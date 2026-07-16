@@ -14,6 +14,14 @@ if ! command -v idf.py >/dev/null 2>&1; then
   exit 1
 fi
 
+required_idf_path="${HOME}/esp/esp-idf-v6.0.1"
+active_idf_version="$(idf.py --version 2>/dev/null)"
+if [ "${IDF_PATH:-}" != "$required_idf_path" ] || [ "$active_idf_version" != "ESP-IDF v6.0.1" ]; then
+  echo "❌ This repo requires ESP-IDF v6.0.1 at $required_idf_path." >&2
+  echo "   Active: IDF_PATH=${IDF_PATH:-unset}, version=$active_idf_version" >&2
+  exit 1
+fi
+
 # Guard 1 — stale gitignored sdkconfig vs tracked defaults
 if [ -f sdkconfig ] && [ sdkconfig.defaults -nt sdkconfig ]; then
   echo "↻ sdkconfig is older than sdkconfig.defaults — regenerating from defaults"
@@ -29,5 +37,5 @@ if [ -f build/project_description.json ]; then
   fi
 fi
 
-echo "▶ $(idf.py --version 2>/dev/null) — building $(basename "$PWD")"
+echo "▶ $active_idf_version — building $(basename "$PWD")"
 exec idf.py build "$@"

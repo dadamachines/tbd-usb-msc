@@ -1,6 +1,6 @@
 #include "spi_api.h"
 #include "freertos/FreeRTOS.h"
-#include "task.h"
+#include "freertos/task.h"
 #include "driver/spi_slave.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
