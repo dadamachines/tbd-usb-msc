@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <dirent.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include "sdkconfig.h"
 #include "esp_console.h"
@@ -331,54 +332,133 @@ static esp_err_t storage_init_spiflash(wl_handle_t *wl_handle)
     return wl_mount(data_partition, wl_handle);
 }
 #else  // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
-static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
-{
-    esp_err_t ret = ESP_OK;
-    bool host_init = false;
-    sdmmc_card_t *sd_card;
+typedef enum {
+    SD_MOUNT_UHS_SDR50,
+    SD_MOUNT_HS_1BIT,
+} sd_mount_mode_t;
 
-    ESP_LOGI(TAG, "Initializing SDCard");
+#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
+static sd_pwr_ctrl_handle_t s_sd_pwr_ctrl_handle = NULL;
+#endif
+
+// ESP-Hosted initializes SDMMC slot 1 before app_main(). Keep the shared host
+// controller alive and initialize/deinitialize only slot 0 for the SD card.
+static esp_err_t sdmmc_host_init_noop(void)
+{
+    return ESP_OK;
+}
+
+static const char *sd_mount_mode_name(sd_mount_mode_t mode)
+{
+    return mode == SD_MOUNT_UHS_SDR50 ? "UHS-I SDR50 4-bit phase 2" : "HS 1-bit phase 0";
+}
+
+static esp_err_t ensure_sd_power_control(void)
+{
+#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
+    if (s_sd_pwr_ctrl_handle != NULL) {
+        return ESP_OK;
+    }
+
+    sd_pwr_ctrl_ldo_config_t ldo_config = {
+        .ldo_chan_id = CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_IO_ID,
+    };
+    esp_err_t ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &s_sd_pwr_ctrl_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create SD on-chip LDO power control (0x%x)", ret);
+    }
+    return ret;
+#else
+    return ESP_OK;
+#endif
+}
+
+static void sd_power_cycle(int settle_ms)
+{
+#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
+    if (ensure_sd_power_control() == ESP_OK) {
+        esp_err_t ret = sd_pwr_ctrl_set_io_voltage(s_sd_pwr_ctrl_handle, 3300);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to force SD IO voltage to 3.3V (0x%x)", ret);
+        }
+    }
+#endif
+
+    gpio_reset_pin(CONFIG_EXAMPLE_PIN_SD_RESET);
+    gpio_set_direction(CONFIG_EXAMPLE_PIN_SD_RESET, GPIO_MODE_OUTPUT);
+    gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 1);
+    vTaskDelay(pdMS_TO_TICKS(settle_ms));
+    gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 0);
+    vTaskDelay(pdMS_TO_TICKS(settle_ms));
+}
+
+static void deinit_sdmmc_host(const sdmmc_host_t *host)
+{
+    if (host->flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
+        host->deinit_p(host->slot);
+    } else {
+        (*host->deinit)();
+    }
+}
+
+static void release_sdmmc(sdmmc_card_t **card)
+{
+    if (card == NULL || *card == NULL) {
+        return;
+    }
+    deinit_sdmmc_host(&(*card)->host);
+    free(*card);
+    *card = NULL;
+}
+
+static bool is_uhs_active(const sdmmc_card_t *card)
+{
+    return card != NULL && card->real_freq_khz > SDMMC_FREQ_HIGHSPEED;
+}
+
+static void log_card_mode(const sdmmc_card_t *card)
+{
+    uint32_t bus_width = card->is_mmc
+                             ? (1u << card->log_bus_width)
+                             : (card->ssr.cur_bus_width ? 4u : 1u);
+    ESP_LOGI(TAG,
+             "SD mode: real=%d kHz limit=%" PRIu32 " kHz bus=%" PRIu32 "-bit card_uhs=%d active_uhs=%d ddr=%d ocr=0x%08" PRIx32,
+             card->real_freq_khz,
+             card->max_freq_khz,
+             bus_width,
+             (int)card->is_uhs1,
+             (int)is_uhs_active(card),
+             (int)card->is_ddr,
+             card->ocr);
+}
+
+static esp_err_t try_init_sdmmc(sdmmc_card_t **card, sd_mount_mode_t mode)
+{
+    ESP_LOGI(TAG, "Initializing SD card for MSC (%s)", sd_mount_mode_name(mode));
+    sd_power_cycle(500);
+
+    esp_err_t ret = ensure_sd_power_control();
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
     host.flags |= SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
-    // Use high-speed timing — NOT DDR50/UHS-I. The configured bus width is
-    // intentionally 1-bit on TBD-16 Rev 3.x: sustained 4-bit MSC writes can
-    // hit SDMMC command timeouts on otherwise healthy cards and board paths.
-    // UHS-I tuning is unreliable on cold boot and failed tuning
-    // corrupts the SDMMC sampling delay for all subsequent commands.
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
-
-    // For SoCs where the SD power can be supplied both via an internal or external (e.g. on-board LDO) power supply.
-    // When using specific IO pins (which can be used for ultra high-speed SDMMC) to connect to the SD card
-    // and the internal LDO power supply, we need to initialize the power supply first.
+    host.flags &= ~SDMMC_HOST_FLAG_DDR;
+    host.max_freq_khz = mode == SD_MOUNT_UHS_SDR50 ? SDMMC_FREQ_SDR50 : SDMMC_FREQ_HIGHSPEED;
+    host.input_delay_phase = mode == SD_MOUNT_UHS_SDR50 ? SDMMC_DELAY_PHASE_2 : SDMMC_DELAY_PHASE_0;
+    host.init = &sdmmc_host_init_noop;
 #if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    sd_pwr_ctrl_ldo_config_t ldo_config = {
-        .ldo_chan_id = CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_IO_ID,
-    };
-    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
-
-    ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create a new on-chip LDO power control driver");
-        return ret;
-    }
-    host.pwr_ctrl_handle = pwr_ctrl_handle;
+    host.pwr_ctrl_handle = s_sd_pwr_ctrl_handle;
 #endif
 
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = mode == SD_MOUNT_UHS_SDR50 ? 4 : 1;
+    if (mode == SD_MOUNT_UHS_SDR50) {
+        slot_config.flags |= SDMMC_SLOT_FLAG_UHS1;
+    }
 
-    // For SD Card, set bus width to use
-#ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-    slot_config.width = 4;
-    // No SDMMC_SLOT_FLAG_UHS1 — UHS-I tuning is unreliable on cold boot.
-#else
-    slot_config.width = 1;
-#endif  // CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-
-    // On chips where the GPIOs used for SD card can be configured, set the user defined values
 #ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
     slot_config.clk = CONFIG_EXAMPLE_PIN_CLK;
     slot_config.cmd = CONFIG_EXAMPLE_PIN_CMD;
@@ -391,78 +471,82 @@ static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
     slot_config.d5 = GPIO_NUM_NC;
     slot_config.d6 = GPIO_NUM_NC;
     slot_config.d7 = GPIO_NUM_NC;
-#endif  // CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
+#endif
+#endif
 
-#endif  // CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
-
-    // Enable internal pullups on enabled pins. The internal pullups
-    // are insufficient however, please make sure 10k external pullups are
-    // connected on the bus. This is for debug / example purpose only.
-    //slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    // not using ff_memalloc here, as allocation in internal RAM is preferred
-    sd_card = (sdmmc_card_t *)malloc(sizeof(sdmmc_card_t));
-    ESP_GOTO_ON_FALSE(sd_card, ESP_ERR_NO_MEM, clean, TAG, "could not allocate new sdmmc_card_t");
-
-    ESP_GOTO_ON_ERROR((*host.init)(), clean, TAG, "Host Config Init fail");
-    host_init = true;
-
-    ESP_GOTO_ON_ERROR(sdmmc_host_init_slot(host.slot, (const sdmmc_slot_config_t *) &slot_config),
-                      clean, TAG, "Host init slot fail");
-
-    // Retry with power cycling and escalating settle times (matches fs.cpp)
-    {
-        const int max_retries = 5;
-        bool card_ok = false;
-        for (int attempt = 1; attempt <= max_retries; attempt++) {
-            int settle_ms = (attempt <= 2) ? 200 + (attempt - 1) * 100
-                                           : 200 + attempt * 100;
-            // Power-cycle: GPIO 45 controls SD card power (active-low)
-            gpio_reset_pin(CONFIG_EXAMPLE_PIN_SD_RESET);
-            gpio_set_direction(CONFIG_EXAMPLE_PIN_SD_RESET, GPIO_MODE_OUTPUT);
-            gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 1);   // power off
-            vTaskDelay(pdMS_TO_TICKS(100));
-            gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 0);   // power on
-            vTaskDelay(pdMS_TO_TICKS(settle_ms));
-
-            if (sdmmc_card_init(&host, sd_card) == ESP_OK) {
-                card_ok = true;
-                break;
-            }
-            ESP_LOGW(TAG, "SD card init attempt %d/%d failed (settle=%dms), retrying...",
-                     attempt, max_retries, settle_ms);
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        if (!card_ok) {
-            ESP_LOGE(TAG, "SD card init failed after %d attempts", max_retries);
-            ret = ESP_FAIL;
-            goto clean;
-        }
+    sdmmc_card_t *sd_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+    if (sd_card == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
-    // Card has been initialized, print its properties
-    sdmmc_card_print_info(stdout, sd_card);
-    *card = sd_card;
-
-    return ESP_OK;
-
-clean:
-    if (host_init) {
-        if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
-            host.deinit_p(host.slot);
-        } else {
-            (*host.deinit)();
-        }
-    }
-    if (sd_card) {
+    ret = (*host.init)();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SDMMC host init failed (0x%x)", ret);
         free(sd_card);
-        sd_card = NULL;
+        return ret;
     }
-#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    // We don't need to duplicate error here as all error messages are handled via sd_pwr_* call
-    sd_pwr_ctrl_del_on_chip_ldo(pwr_ctrl_handle);
-#endif // CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    return ret;
+
+    ret = sdmmc_host_init_slot(host.slot, &slot_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SDMMC slot init failed (0x%x)", ret);
+        deinit_sdmmc_host(&host);
+        free(sd_card);
+        return ret;
+    }
+
+    ret = sdmmc_card_init(&host, sd_card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD card init failed in %s mode (0x%x)", sd_mount_mode_name(mode), ret);
+        deinit_sdmmc_host(&host);
+        free(sd_card);
+        return ret;
+    }
+
+    sdmmc_card_print_info(stdout, sd_card);
+    log_card_mode(sd_card);
+    *card = sd_card;
+    return ESP_OK;
+}
+
+static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
+{
+#ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
+    const int max_uhs_attempts = 5;
+    esp_err_t last_error = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= max_uhs_attempts; ++attempt) {
+        last_error = try_init_sdmmc(card, SD_MOUNT_UHS_SDR50);
+        if (last_error != ESP_OK) {
+            ESP_LOGW(TAG, "UHS-I init attempt %d/%d failed (0x%x)",
+                     attempt, max_uhs_attempts, last_error);
+            break;
+        }
+
+        if (is_uhs_active(*card)) {
+            if (attempt > 1) {
+                ESP_LOGI(TAG, "SD UHS recovered after MSC init attempt %d/%d",
+                         attempt, max_uhs_attempts);
+            }
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG,
+                 "SD initialized below UHS speed on attempt %d/%d; real=%d kHz limit=%" PRIu32 " kHz card_uhs=%d",
+                 attempt,
+                 max_uhs_attempts,
+                 (*card)->real_freq_khz,
+                 (*card)->max_freq_khz,
+                 (int)(*card)->is_uhs1);
+        release_sdmmc(card);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#else
+    ESP_LOGW(TAG, "4-bit pins are disabled at build time; skipping UHS-I attempts");
+#endif
+
+    ESP_LOGW(TAG, "Falling back to conservative SD mode for MSC: %s",
+             sd_mount_mode_name(SD_MOUNT_HS_1BIT));
+    return try_init_sdmmc(card, SD_MOUNT_HS_1BIT);
 }
 #endif  // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
 
