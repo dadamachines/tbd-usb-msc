@@ -342,7 +342,9 @@ static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
     host.flags |= SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
-    // Use high-speed 50 MHz 4-bit — NOT DDR50/UHS-I.
+    // Use high-speed timing — NOT DDR50/UHS-I. The configured bus width is
+    // intentionally 1-bit on TBD-16 Rev 3.x: sustained 4-bit MSC writes can
+    // hit SDMMC command timeouts on otherwise healthy cards and board paths.
     // UHS-I tuning is unreliable on cold boot and failed tuning
     // corrupts the SDMMC sampling delay for all subsequent commands.
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
