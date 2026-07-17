@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <dirent.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include "sdkconfig.h"
 #include "esp_console.h"
@@ -20,7 +21,8 @@
 #include "esp_partition.h"
 #include "driver/gpio.h"
 #include "tinyusb.h"
-#include "tusb_msc_storage.h"
+#include "tinyusb_default_config.h"
+#include "tinyusb_msc.h"
 #include "esp_ota_ops.h"
 #include "spi_api.h"
 #include "ota_c6_sdcard.h"
@@ -47,6 +49,9 @@
 
 static const char *TAG = "example_main";
 static esp_console_repl_t *repl = NULL;
+static tinyusb_msc_storage_handle_t storage_hdl = NULL;
+static volatile tinyusb_msc_mount_point_t storage_mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB;
+static volatile bool host_was_mounted = false;
 
 static SemaphoreHandle_t _wait_console_smp = NULL;
 
@@ -172,49 +177,27 @@ const esp_console_cmd_t cmds[] = {
     }
 };
 
-// mount the partition and show all the files in BASE_PATH
-static void _mount(void)
+static bool storage_is_mounted_to_app(void)
 {
-    ESP_LOGI(TAG, "Mount storage...");
-    ESP_ERROR_CHECK(tinyusb_msc_storage_mount(BASE_PATH));
-
-    // List all the files in this directory
-    ESP_LOGI(TAG, "\nls command output:");
-    struct dirent *d;
-    DIR *dh = opendir(BASE_PATH);
-    if (!dh) {
-        if (errno == ENOENT) {
-            //If the directory is not found
-            ESP_LOGE(TAG, "Directory doesn't exist %s", BASE_PATH);
-        } else {
-            //If the directory is not readable then throw error and exit
-            ESP_LOGE(TAG, "Unable to read directory %s", BASE_PATH);
-        }
-        return;
-    }
-    //While the next entry is not readable we will print directory files
-    while ((d = readdir(dh)) != NULL) {
-        printf("%s\n", d->d_name);
-    }
-    return;
+    return storage_mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP;
 }
 
-// unmount storage
+// Expose storage to the USB host.
 static int console_unmount(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage is already exposed");
         return -1;
     }
-    ESP_LOGI(TAG, "Unmount storage...");
-    ESP_ERROR_CHECK(tinyusb_msc_storage_unmount());
+    ESP_LOGI(TAG, "Expose storage to USB host...");
+    ESP_ERROR_CHECK(tinyusb_msc_set_storage_mount_point(storage_hdl, TINYUSB_MSC_STORAGE_MOUNT_USB));
     return 0;
 }
 
 // read BASE_PATH/README.MD and print its contents
 static int console_read(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage exposed over USB. Application can't read from storage.");
         return -1;
     }
@@ -236,7 +219,7 @@ static int console_read(int argc, char **argv)
 // create file BASE_PATH/README.MD if it does not exist
 static int console_write(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage exposed over USB. Application can't write to storage.");
         return -1;
     }
@@ -257,12 +240,14 @@ static int console_write(int argc, char **argv)
 // Show storage size and sector size
 static int console_size(int argc, char **argv)
 {
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
+    if (!storage_is_mounted_to_app()) {
         ESP_LOGE(TAG, "storage exposed over USB. Application can't access storage");
         return -1;
     }
-    uint32_t sec_count = tinyusb_msc_storage_get_sector_count();
-    uint32_t sec_size = tinyusb_msc_storage_get_sector_size();
+    uint32_t sec_count = 0;
+    uint32_t sec_size = 0;
+    ESP_ERROR_CHECK(tinyusb_msc_get_storage_capacity(storage_hdl, &sec_count));
+    ESP_ERROR_CHECK(tinyusb_msc_get_storage_sector_size(storage_hdl, &sec_size));
     printf("Storage Capacity %lluMB\n", ((uint64_t) sec_count) * sec_size / (1024 * 1024));
     return 0;
 }
@@ -270,15 +255,17 @@ static int console_size(int argc, char **argv)
 // Show storage status
 static int console_status(int argc, char **argv)
 {
-    printf("storage exposed over USB: %s\n", tinyusb_msc_storage_in_use_by_usb_host() ? "Yes" : "No");
+    printf("storage exposed over USB: %s\n", storage_is_mounted_to_app() ? "No" : "Yes");
     return 0;
 }
 
 // Exit from application
 static int console_exit(int argc, char **argv)
 {
-    tinyusb_msc_unregister_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED);
-    tinyusb_msc_storage_deinit();
+    if (storage_hdl != NULL) {
+        ESP_ERROR_CHECK(tinyusb_msc_delete_storage(storage_hdl));
+        storage_hdl = NULL;
+    }
     tinyusb_driver_uninstall();
 
     xSemaphoreGive(_wait_console_smp);
@@ -299,20 +286,40 @@ void boot_into_slot(int slot) { // slot 0 or 1
     printf("Boot into %s\n not successful", p->label);
 }
 
-// callback that is delivered when storage is mounted/unmounted by application.
-static void storage_mount_changed_cb(tinyusb_msc_event_t *event)
+// IDF 6 reports explicit target mount points. A host eject remounts the FAT
+// filesystem to the application; only then is local C6 update access safe.
+static void storage_mount_changed_cb(tinyusb_msc_storage_handle_t handle,
+                                     tinyusb_msc_event_t *event,
+                                     void *arg)
 {
-    static bool first_time = false;
-    ESP_LOGI(TAG, "Storage mounted to application: %s", event->mount_changed_data.is_mounted ? "Yes" : "No");
-    // when storage is dismounted for the first time, boot into ota_0
-    if (!first_time && tinyusb_msc_storage_in_use_by_usb_host()){
-        first_time = true;
+    (void)handle;
+    (void)arg;
+
+    if (event->id == TINYUSB_MSC_EVENT_MOUNT_START) {
+        ESP_LOGI(TAG, "MSC mount transition starting: target=%s",
+                 event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
+        return;
     }
-    if (first_time && !tinyusb_msc_storage_in_use_by_usb_host()){
-        // check if updating c6 is desired
-        ESP_ERROR_CHECK(tinyusb_msc_storage_mount(BASE_PATH));
+
+    if (event->id != TINYUSB_MSC_EVENT_MOUNT_COMPLETE) {
+        ESP_LOGE(TAG, "MSC mount transition failed: event=%d target=%s",
+                 (int)event->id,
+                 event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
+        return;
+    }
+
+    storage_mount_point = event->mount_point;
+    ESP_LOGI(TAG, "MSC mount transition complete: target=%s",
+             event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
+
+    if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB) {
+        host_was_mounted = true;
+        return;
+    }
+
+    if (host_was_mounted) {
+        host_was_mounted = false;
         ota_c6_sd_perform(true, BASE_PATH "/c6_fw");
-        ESP_ERROR_CHECK(tinyusb_msc_storage_unmount());
         boot_into_slot(0);
     }
 }
@@ -331,52 +338,133 @@ static esp_err_t storage_init_spiflash(wl_handle_t *wl_handle)
     return wl_mount(data_partition, wl_handle);
 }
 #else  // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
-static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
-{
-    esp_err_t ret = ESP_OK;
-    bool host_init = false;
-    sdmmc_card_t *sd_card;
+typedef enum {
+    SD_MOUNT_UHS_SDR50,
+    SD_MOUNT_HS_1BIT,
+} sd_mount_mode_t;
 
-    ESP_LOGI(TAG, "Initializing SDCard");
+#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
+static sd_pwr_ctrl_handle_t s_sd_pwr_ctrl_handle = NULL;
+#endif
+
+// ESP-Hosted initializes SDMMC slot 1 before app_main(). Keep the shared host
+// controller alive and initialize/deinitialize only slot 0 for the SD card.
+static esp_err_t sdmmc_host_init_noop(void)
+{
+    return ESP_OK;
+}
+
+static const char *sd_mount_mode_name(sd_mount_mode_t mode)
+{
+    return mode == SD_MOUNT_UHS_SDR50 ? "UHS-I SDR50 4-bit phase 2" : "HS 1-bit phase 0";
+}
+
+static esp_err_t ensure_sd_power_control(void)
+{
+#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
+    if (s_sd_pwr_ctrl_handle != NULL) {
+        return ESP_OK;
+    }
+
+    sd_pwr_ctrl_ldo_config_t ldo_config = {
+        .ldo_chan_id = CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_IO_ID,
+    };
+    esp_err_t ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &s_sd_pwr_ctrl_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create SD on-chip LDO power control (0x%x)", ret);
+    }
+    return ret;
+#else
+    return ESP_OK;
+#endif
+}
+
+static void sd_power_cycle(int settle_ms)
+{
+#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
+    if (ensure_sd_power_control() == ESP_OK) {
+        esp_err_t ret = sd_pwr_ctrl_set_io_voltage(s_sd_pwr_ctrl_handle, 3300);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to force SD IO voltage to 3.3V (0x%x)", ret);
+        }
+    }
+#endif
+
+    gpio_reset_pin(CONFIG_EXAMPLE_PIN_SD_RESET);
+    gpio_set_direction(CONFIG_EXAMPLE_PIN_SD_RESET, GPIO_MODE_OUTPUT);
+    gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 1);
+    vTaskDelay(pdMS_TO_TICKS(settle_ms));
+    gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 0);
+    vTaskDelay(pdMS_TO_TICKS(settle_ms));
+}
+
+static void deinit_sdmmc_host(const sdmmc_host_t *host)
+{
+    if (host->flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
+        host->deinit_p(host->slot);
+    } else {
+        (*host->deinit)();
+    }
+}
+
+static void release_sdmmc(sdmmc_card_t **card)
+{
+    if (card == NULL || *card == NULL) {
+        return;
+    }
+    deinit_sdmmc_host(&(*card)->host);
+    free(*card);
+    *card = NULL;
+}
+
+static bool is_uhs_active(const sdmmc_card_t *card)
+{
+    return card != NULL && card->real_freq_khz > SDMMC_FREQ_HIGHSPEED;
+}
+
+static void log_card_mode(const sdmmc_card_t *card)
+{
+    uint32_t bus_width = card->is_mmc
+                             ? (1u << card->log_bus_width)
+                             : (card->ssr.cur_bus_width ? 4u : 1u);
+    ESP_LOGI(TAG,
+             "SD mode: real=%d kHz limit=%" PRIu32 " kHz bus=%" PRIu32 "-bit card_uhs=%d active_uhs=%d ddr=%d ocr=0x%08" PRIx32,
+             card->real_freq_khz,
+             card->max_freq_khz,
+             bus_width,
+             (int)card->is_uhs1,
+             (int)is_uhs_active(card),
+             (int)card->is_ddr,
+             card->ocr);
+}
+
+static esp_err_t try_init_sdmmc(sdmmc_card_t **card, sd_mount_mode_t mode)
+{
+    ESP_LOGI(TAG, "Initializing SD card for MSC (%s)", sd_mount_mode_name(mode));
+    sd_power_cycle(500);
+
+    esp_err_t ret = ensure_sd_power_control();
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
     host.flags |= SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
-    // Use high-speed 50 MHz 4-bit — NOT DDR50/UHS-I.
-    // UHS-I tuning is unreliable on cold boot and failed tuning
-    // corrupts the SDMMC sampling delay for all subsequent commands.
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
-
-    // For SoCs where the SD power can be supplied both via an internal or external (e.g. on-board LDO) power supply.
-    // When using specific IO pins (which can be used for ultra high-speed SDMMC) to connect to the SD card
-    // and the internal LDO power supply, we need to initialize the power supply first.
+    host.flags &= ~SDMMC_HOST_FLAG_DDR;
+    host.max_freq_khz = mode == SD_MOUNT_UHS_SDR50 ? SDMMC_FREQ_SDR50 : SDMMC_FREQ_HIGHSPEED;
+    host.input_delay_phase = mode == SD_MOUNT_UHS_SDR50 ? SDMMC_DELAY_PHASE_2 : SDMMC_DELAY_PHASE_0;
+    host.init = &sdmmc_host_init_noop;
 #if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    sd_pwr_ctrl_ldo_config_t ldo_config = {
-        .ldo_chan_id = CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_IO_ID,
-    };
-    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
-
-    ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create a new on-chip LDO power control driver");
-        return ret;
-    }
-    host.pwr_ctrl_handle = pwr_ctrl_handle;
+    host.pwr_ctrl_handle = s_sd_pwr_ctrl_handle;
 #endif
 
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = mode == SD_MOUNT_UHS_SDR50 ? 4 : 1;
+    if (mode == SD_MOUNT_UHS_SDR50) {
+        slot_config.flags |= SDMMC_SLOT_FLAG_UHS1;
+    }
 
-    // For SD Card, set bus width to use
-#ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-    slot_config.width = 4;
-    // No SDMMC_SLOT_FLAG_UHS1 — UHS-I tuning is unreliable on cold boot.
-#else
-    slot_config.width = 1;
-#endif  // CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-
-    // On chips where the GPIOs used for SD card can be configured, set the user defined values
 #ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
     slot_config.clk = CONFIG_EXAMPLE_PIN_CLK;
     slot_config.cmd = CONFIG_EXAMPLE_PIN_CMD;
@@ -389,78 +477,82 @@ static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
     slot_config.d5 = GPIO_NUM_NC;
     slot_config.d6 = GPIO_NUM_NC;
     slot_config.d7 = GPIO_NUM_NC;
-#endif  // CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
+#endif
+#endif
 
-#endif  // CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
-
-    // Enable internal pullups on enabled pins. The internal pullups
-    // are insufficient however, please make sure 10k external pullups are
-    // connected on the bus. This is for debug / example purpose only.
-    //slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    // not using ff_memalloc here, as allocation in internal RAM is preferred
-    sd_card = (sdmmc_card_t *)malloc(sizeof(sdmmc_card_t));
-    ESP_GOTO_ON_FALSE(sd_card, ESP_ERR_NO_MEM, clean, TAG, "could not allocate new sdmmc_card_t");
-
-    ESP_GOTO_ON_ERROR((*host.init)(), clean, TAG, "Host Config Init fail");
-    host_init = true;
-
-    ESP_GOTO_ON_ERROR(sdmmc_host_init_slot(host.slot, (const sdmmc_slot_config_t *) &slot_config),
-                      clean, TAG, "Host init slot fail");
-
-    // Retry with power cycling and escalating settle times (matches fs.cpp)
-    {
-        const int max_retries = 5;
-        bool card_ok = false;
-        for (int attempt = 1; attempt <= max_retries; attempt++) {
-            int settle_ms = (attempt <= 2) ? 200 + (attempt - 1) * 100
-                                           : 200 + attempt * 100;
-            // Power-cycle: GPIO 45 controls SD card power (active-low)
-            gpio_reset_pin(CONFIG_EXAMPLE_PIN_SD_RESET);
-            gpio_set_direction(CONFIG_EXAMPLE_PIN_SD_RESET, GPIO_MODE_OUTPUT);
-            gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 1);   // power off
-            vTaskDelay(pdMS_TO_TICKS(100));
-            gpio_set_level(CONFIG_EXAMPLE_PIN_SD_RESET, 0);   // power on
-            vTaskDelay(pdMS_TO_TICKS(settle_ms));
-
-            if (sdmmc_card_init(&host, sd_card) == ESP_OK) {
-                card_ok = true;
-                break;
-            }
-            ESP_LOGW(TAG, "SD card init attempt %d/%d failed (settle=%dms), retrying...",
-                     attempt, max_retries, settle_ms);
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        if (!card_ok) {
-            ESP_LOGE(TAG, "SD card init failed after %d attempts", max_retries);
-            ret = ESP_FAIL;
-            goto clean;
-        }
+    sdmmc_card_t *sd_card = (sdmmc_card_t *)calloc(1, sizeof(sdmmc_card_t));
+    if (sd_card == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
-    // Card has been initialized, print its properties
-    sdmmc_card_print_info(stdout, sd_card);
-    *card = sd_card;
-
-    return ESP_OK;
-
-clean:
-    if (host_init) {
-        if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
-            host.deinit_p(host.slot);
-        } else {
-            (*host.deinit)();
-        }
-    }
-    if (sd_card) {
+    ret = (*host.init)();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SDMMC host init failed (0x%x)", ret);
         free(sd_card);
-        sd_card = NULL;
+        return ret;
     }
-#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    // We don't need to duplicate error here as all error messages are handled via sd_pwr_* call
-    sd_pwr_ctrl_del_on_chip_ldo(pwr_ctrl_handle);
-#endif // CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    return ret;
+
+    ret = sdmmc_host_init_slot(host.slot, &slot_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SDMMC slot init failed (0x%x)", ret);
+        deinit_sdmmc_host(&host);
+        free(sd_card);
+        return ret;
+    }
+
+    ret = sdmmc_card_init(&host, sd_card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD card init failed in %s mode (0x%x)", sd_mount_mode_name(mode), ret);
+        deinit_sdmmc_host(&host);
+        free(sd_card);
+        return ret;
+    }
+
+    sdmmc_card_print_info(stdout, sd_card);
+    log_card_mode(sd_card);
+    *card = sd_card;
+    return ESP_OK;
+}
+
+static esp_err_t storage_init_sdmmc(sdmmc_card_t **card)
+{
+#ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
+    const int max_uhs_attempts = 5;
+    esp_err_t last_error = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= max_uhs_attempts; ++attempt) {
+        last_error = try_init_sdmmc(card, SD_MOUNT_UHS_SDR50);
+        if (last_error != ESP_OK) {
+            ESP_LOGW(TAG, "UHS-I init attempt %d/%d failed (0x%x)",
+                     attempt, max_uhs_attempts, last_error);
+            break;
+        }
+
+        if (is_uhs_active(*card)) {
+            if (attempt > 1) {
+                ESP_LOGI(TAG, "SD UHS recovered after MSC init attempt %d/%d",
+                         attempt, max_uhs_attempts);
+            }
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG,
+                 "SD initialized below UHS speed on attempt %d/%d; real=%d kHz limit=%" PRIu32 " kHz card_uhs=%d",
+                 attempt,
+                 max_uhs_attempts,
+                 (*card)->real_freq_khz,
+                 (*card)->max_freq_khz,
+                 (int)(*card)->is_uhs1);
+        release_sdmmc(card);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#else
+    ESP_LOGW(TAG, "4-bit pins are disabled at build time; skipping UHS-I attempts");
+#endif
+
+    ESP_LOGW(TAG, "Falling back to conservative SD mode for MSC: %s",
+             sd_mount_mode_name(SD_MOUNT_HS_1BIT));
+    return try_init_sdmmc(card, SD_MOUNT_HS_1BIT);
 }
 #endif  // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
 
@@ -474,47 +566,42 @@ void app_main(void)
         return;
     }
 
+    tinyusb_msc_storage_config_t storage_cfg = {
+        .fat_fs = {
+            .base_path = BASE_PATH,
+            .config = VFS_FAT_MOUNT_DEFAULT_CONFIG(),
+            .do_not_format = true,
+            .format_flags = 0,
+        },
+        .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
+    };
+
 #ifdef CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
     static wl_handle_t wl_handle = WL_INVALID_HANDLE;
     ESP_ERROR_CHECK(storage_init_spiflash(&wl_handle));
-
-    const tinyusb_msc_spiflash_config_t config_spi = {
-        .wl_handle = wl_handle,
-        .callback_mount_changed = storage_mount_changed_cb,  /* First way to register the callback. This is while initializing the storage. */
-        .mount_config.max_files = 5,
-    };
-    ESP_ERROR_CHECK(tinyusb_msc_storage_init_spiflash(&config_spi));
-    ESP_ERROR_CHECK(tinyusb_msc_register_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED, storage_mount_changed_cb)); /* Other way to register the callback i.e. registering using separate API. If the callback had been already registered, it will be overwritten. */
+    storage_cfg.medium.wl_handle = wl_handle;
+    ESP_ERROR_CHECK(tinyusb_msc_new_storage_spiflash(&storage_cfg, &storage_hdl));
 #else // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
     static sdmmc_card_t *card = NULL;
     ESP_ERROR_CHECK(storage_init_sdmmc(&card));
+    storage_cfg.medium.card = card;
+    ESP_ERROR_CHECK(tinyusb_msc_new_storage_sdmmc(&storage_cfg, &storage_hdl));
+#endif
 
-    const tinyusb_msc_sdmmc_config_t config_sdmmc = {
-        .card = card,
-        .callback_mount_changed = storage_mount_changed_cb,  /* First way to register the callback. This is while initializing the storage. */
-        .mount_config.max_files = 5,
-    };
-    ESP_ERROR_CHECK(tinyusb_msc_storage_init_sdmmc(&config_sdmmc));
-    ESP_ERROR_CHECK(tinyusb_msc_register_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED, storage_mount_changed_cb)); /* Other way to register the callback i.e. registering using separate API. If the callback had been already registered, it will be overwritten. */
-#endif  // CONFIG_EXAMPLE_STORAGE_MEDIA_SPIFLASH
-
-    //mounted in the app by default
-    _mount();
+    ESP_ERROR_CHECK(tinyusb_msc_set_storage_callback(storage_mount_changed_cb, NULL));
 
     ESP_LOGI(TAG, "USB MSC initialization");
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor = &descriptor_config,
-        .string_descriptor = string_desc_arr,
-        .string_descriptor_count = sizeof(string_desc_arr) / sizeof(string_desc_arr[0]),
-        .external_phy = false,
-#if (TUD_OPT_HIGH_SPEED)
-        .fs_configuration_descriptor = msc_fs_configuration_desc,
-        .hs_configuration_descriptor = msc_hs_configuration_desc,
-        .qualifier_descriptor = &device_qualifier,
-#else
-        .configuration_descriptor = msc_fs_configuration_desc,
-#endif // TUD_OPT_HIGH_SPEED
-    };
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    tusb_cfg.port = TINYUSB_PORT_HIGH_SPEED_0;
+    tusb_cfg.task = TINYUSB_TASK_CUSTOM(4096, 10, 0);
+    tusb_cfg.descriptor.device = &descriptor_config;
+    tusb_cfg.descriptor.full_speed_config = msc_fs_configuration_desc;
+    tusb_cfg.descriptor.string = string_desc_arr;
+    tusb_cfg.descriptor.string_count = sizeof(string_desc_arr) / sizeof(string_desc_arr[0]);
+#if TUD_OPT_HIGH_SPEED
+    tusb_cfg.descriptor.high_speed_config = msc_hs_configuration_desc;
+    tusb_cfg.descriptor.qualifier = &device_qualifier;
+#endif
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
     ESP_LOGI(TAG, "USB MSC initialization DONE");
 

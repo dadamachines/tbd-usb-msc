@@ -1,6 +1,6 @@
 #include "spi_api.h"
 #include "freertos/FreeRTOS.h"
-#include "task.h"
+#include "freertos/task.h"
 #include "driver/spi_slave.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -206,16 +206,28 @@ void spi_start(){
     gpio_config(&io_conf);
     gpio_set_level(GPIO_HANDSHAKE, 0);
 
+    // Initialize the SPI slave bus BEFORE allocating its DMA buffers: on
+    // IDF 6 spi_bus_dma_memory_alloc() returns NULL until the host/DMA channel
+    // is set up, and the old order dereferenced that NULL (send_buffer[0]),
+    // panicking (Store access fault) right after USB MSC init on the P4.
+    esp_err_t ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE("spi_api", "spi_slave_initialize failed (%s); RP2350 SPI bridge disabled, USB MSC continues",
+                 esp_err_to_name(ret));
+        return;
+    }
+
     send_buffer = (uint8_t*)spi_bus_dma_memory_alloc(RCV_HOST, 2048, 0);
+    receive_buffer = (uint8_t*)spi_bus_dma_memory_alloc(RCV_HOST, 2048, 0);
+    if (send_buffer == NULL || receive_buffer == NULL) {
+        ESP_LOGE("spi_api", "SPI DMA buffer alloc failed; RP2350 SPI bridge disabled, USB MSC continues");
+        return;
+    }
     send_buffer[0] = 0xCA;
     send_buffer[1] = 0xFE;
-    receive_buffer = (uint8_t*)spi_bus_dma_memory_alloc(RCV_HOST, 2048, 0);
     transaction.length = 2048 * 8;
     transaction.tx_buffer = send_buffer;
     transaction.rx_buffer = receive_buffer;
-
-    esp_err_t ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
-    assert(ret == ESP_OK);
 
     xTaskCreatePinnedToCore(api_task, "spi_task", 4096 * 2, NULL, 10, &hTask, 1);
 }

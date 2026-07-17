@@ -1,11 +1,16 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  espressif/esp_tinyusb: "1.7.6~2"
-  idf: "^5.0"
+  # Pin the USB stack to the versions that work on ESP32-P4 rev 3.x, matching
+  # dadamachines-ctag-tbd-dev staging (#43). TinyUSB 0.21.0~1 panics on this
+  # silicon right after USB MSC init (Store access fault); 0.19.0~3 is stable.
+  espressif/esp_tinyusb: "==2.2.1"
+  espressif/tinyusb: "==0.19.0~3"
+  idf: ">=6.0.1"
   espressif/esp_hosted:
     rules:
       - if: target in [esp32p4, esp32h2]
+    version: "^2.12.11"
   espressif/esp_wifi_remote:
     rules:
       - if: target in [esp32p4, esp32h2]
-    version: '>=0.10,<2.0'
+    version: "^1.6.2"

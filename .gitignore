@@ -2,7 +2,6 @@
 build/
 sdkconfig
 sdkconfig.old
-dependencies.lock
 managed_components/
 *.map
 *.elf
@@ -24,3 +23,5 @@ venv/
 
 # Python cache
 __pycache__/
+
+dependencies.lock

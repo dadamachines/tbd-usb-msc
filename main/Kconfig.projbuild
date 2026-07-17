@@ -23,6 +23,9 @@ menu "TinyUSB MSC Example Configuration"
             default EXAMPLE_SDMMC_BUS_WIDTH_4
             help
                 Select the bus width of SD or MMC interface.
+                On TBD-16 Rev 3.x, select 4 lines to compile the D1-D3 pin map.
+                Runtime initialization first attempts tuned UHS-I 4-bit and
+                automatically falls back to High Speed 1-bit when needed.
                 Note that even if 1 line mode is used, D3 pin of the SD card must
                 have a pull-up resistor connected. Otherwise the card may enter
                 SPI mode, the only way to recover from which is to cycle power to the card.

@@ -9,7 +9,7 @@ This is a fork of [ctag-fh-kiel/tbd-usb-msc](https://github.com/ctag-fh-kiel/tbd
 This firmware runs in the **OTA1 slot** of the TBD-16 as a "housekeeping" partition:
 
 - **SD card over USB** — Mounts the SD card as a USB Mass Storage device so a host PC can read/write files directly
-- **Auto-reboot** — When the host ejects the drive, the device reboots back into the main firmware (OTA0)
+- **Auto-reboot** — When the host unmounts/ejects the drive, the device reboots back into the main firmware (OTA0)
 - **SPI command API** — Accepts commands from the RP2350 sequencer bridge over SPI
 - **ESP32-C6 OTA** — Flashes ESP-Hosted slave firmware to the on-board ESP32-C6 WiFi module from a file on the SD card
 
@@ -20,17 +20,39 @@ This firmware runs in the **OTA1 slot** of the TBD-16 as a "housekeeping" partit
 | ESP32-P4 (TBD-16) | **Primary** — actively developed and tested |
 | ESP32-S3 | Upstream support (not tested with TBD-16 hardware) |
 
+### Rev 3.x SDMMC strategy
+
+ESP32-P4 Rev 3.1 testing found card-dependent initialization and sustained-write
+failures when a card remained in a marginal non-UHS 4-bit mode. The Rev 3.x
+helper therefore:
+
+1. restores the SD I/O rail to 3.3 V and power-cycles the card;
+2. attempts tuned UHS-I SDR50 at 100 MHz, 4-bit, phase 2 with DDR disabled;
+3. validates the actual negotiated mode and releases slot-0 state before retry;
+4. falls back to High Speed 1-bit, phase 0 when UHS cannot be established.
+
+Every successful initialization logs real frequency, configured limit, bus
+width, UHS/DDR state, and OCR. A successful compile is not sufficient release
+evidence: new builds require sustained archive extraction, checksum verification,
+multiple cold starts, and multiple production card models before release.
+
+On macOS, close MSC access with `sync`, then an explicit successful
+`diskutil unmount` of the volume, and only then optionally eject the whole disk.
+Never eject a still-mounted volume.
+
 ## Building
 
-Requires [ESP-IDF v5.5.x](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32p4/get-started/index.html).
+Requires [ESP-IDF v6.0.1](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32p4/get-started/index.html), matching the main TBD-16 P4 firmware.
 
 ```bash
-source ~/esp/esp-idf/export.sh
-idf.py set-target esp32p4
-idf.py build
+source ~/esp/esp-idf-v6.0.1/export.sh
+./build.sh
 ```
 
-The build system automatically applies patches from `patches/` to ESP-IDF at configure time.
+The component manifest tracks the latest reviewed stable ESP-Hosted and
+Espressif TinyUSB lines. Run `idf.py update-dependencies` deliberately when
+refreshing these packages, review the resolved versions, and commit any manifest
+constraint changes. Do not patch a shared ESP-IDF installation from this repo.
 
 ## Flashing
 
@@ -43,9 +65,7 @@ main/
   tusb_msc_main.c      USB MSC device setup and console commands
   spi_api.c/h           SPI slave command interface (RP2350 bridge)
   ota_c6_sdcard.c/h     ESP32-C6 firmware update from SD card
-  custom_sdmmc_cmd.c    SDMMC command wrappers with retry/error handling
   Kconfig.projbuild     Menuconfig options (storage media, pin config)
-patches/                ESP-IDF patches applied at build time
 ```
 
 ## Related Repositories
