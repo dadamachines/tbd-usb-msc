@@ -23,3 +23,5 @@ venv/
 
 # Python cache
 __pycache__/
+
+dependencies.lock
